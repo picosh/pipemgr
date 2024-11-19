@@ -1,0 +1,251 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"io"
+	"log/slog"
+	"maps"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"time"
+
+	ct "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/client"
+	"github.com/picosh/utils/pipe"
+	"github.com/picosh/utils/pipe/metrics"
+)
+
+func createDockerClient() *client.Client {
+	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		slog.Error(
+			"Unable to create docker client",
+			slog.Any("error", err),
+		)
+		panic(err)
+	}
+
+	return dockerClient
+}
+
+func containerStart(ctx context.Context, logger *slog.Logger, client *client.Client, reconn io.Writer, containerID string) error {
+	containerInfo, err := client.ContainerInspect(context.Background(), containerID)
+	if err != nil {
+		logger.Error(
+			"Unable to inspect container info",
+			slog.Any("error", err),
+		)
+		return err
+	}
+
+	logger.Debug(
+		"Container info",
+		slog.Any("container_info", containerInfo),
+	)
+
+	isEnabled := false
+	if enabledRaw, ok := containerInfo.Config.Labels["pipemgr.enable"]; ok {
+		if enabledRaw == "true" {
+			isEnabled = true
+		}
+	}
+
+	if !isEnabled {
+		return nil
+	}
+	logger.Info("connecting to logs", "container", containerID)
+	opts := ct.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     true,
+		Since:      "0m",
+	}
+	readCloser, err := client.ContainerLogs(ctx, containerID, opts)
+	if err != nil {
+		logger.Error("unable to fetch container logs", "err", err)
+	}
+	go func() {
+		_, err = io.Copy(reconn, readCloser)
+		if err != nil {
+			logger.Error("cannot write to pipe topic", "err", err)
+		}
+	}()
+
+	return nil
+}
+
+func main() {
+	logLevelFlag := flag.String("log-level", "info", "Log level to set for the logger. Can be debug, warn, error, or info")
+	remoteHostFlag := flag.String("remote-host", "pipe.pico.sh:22", "The remote host to connect to in the format of host:port")
+	remoteHostnameFlag := flag.String("remote-hostname", "pipe.pico.sh", "The remote hostname to verify the host key")
+	remoteUserFlag := flag.String("remote-user", "", "The remote user to connect as")
+	keyLocationFlag := flag.String("remote-key-location", "/key", "The location on the filesystem of where to access the ssh key")
+	keyPassphraseFlag := flag.String("remote-key-passphrase", "", "The passphrase for an encrypted ssh key")
+
+	flag.Parse()
+
+	var rootLoggerLevel slog.Level
+
+	switch strings.ToLower(*logLevelFlag) {
+	case "debug":
+		rootLoggerLevel = slog.LevelDebug
+	case "warn":
+		rootLoggerLevel = slog.LevelWarn
+	case "error":
+		rootLoggerLevel = slog.LevelError
+	default:
+		rootLoggerLevel = slog.LevelInfo
+	}
+
+	rootLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: rootLoggerLevel,
+	}))
+
+	slog.SetDefault(rootLogger)
+
+	networks := []string{}
+
+	dockerClient := createDockerClient()
+	defer dockerClient.Close()
+
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		rootLogger.Error(
+			"Unable to get hostname",
+			slog.Any("error", err),
+		)
+	} else {
+		info, err := dockerClient.ContainerInspect(context.Background(), hostname)
+		if err != nil {
+			rootLogger.Error(
+				"Unable to find networks. Please provide a list to monitor",
+				slog.Any("error", err),
+			)
+			panic(err)
+		}
+
+		for netw := range maps.Keys(info.NetworkSettings.Networks) {
+			networks = append(networks, strings.ToLower(strings.TrimSpace(netw)))
+		}
+	}
+
+	info := &pipe.SSHClientInfo{
+		RemoteHost:     *remoteHostFlag,
+		RemoteHostname: *remoteHostnameFlag,
+		RemoteUser:     *remoteUserFlag,
+		KeyLocation:    *keyLocationFlag,
+		KeyPassphrase:  *keyPassphraseFlag,
+	}
+	ctx := context.Background()
+
+	reconn := metrics.RegisterReconnectMetricRecorder(
+		ctx,
+		rootLogger,
+		info,
+		100,
+		10*time.Millisecond,
+	)
+
+	rootLogger = rootLogger.With(
+		slog.String("docker", dockerClient.DaemonHost()),
+		slog.String("docker_version", dockerClient.ClientVersion()),
+	)
+
+	rootLogger.Info("Started pipemgr")
+
+	rootLogger.Debug(
+		"Flags",
+		"log_level", *logLevelFlag,
+		"networks", networks,
+		"remote_host", *remoteHostFlag,
+		"remote_hostname", *remoteHostnameFlag,
+		"remote_user", *remoteUserFlag,
+		"key_location", *keyLocationFlag,
+		"key_passphrase", *keyPassphraseFlag,
+	)
+
+	go func() {
+		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(200)
+		})
+
+		err := http.ListenAndServe("localhost:8080", nil)
+		if err != nil {
+			rootLogger.Error("error with http server", slog.Any("error", err))
+		}
+	}()
+
+	go func() {
+		eventCtx, cancelEventCtx := context.WithCancel(context.Background())
+		clientEvents, errs := dockerClient.Events(eventCtx, events.ListOptions{})
+
+		containers, err := dockerClient.ContainerList(context.Background(), ct.ListOptions{})
+		if err != nil {
+			rootLogger.Error(
+				"unable to list container from docker",
+				slog.Any("error", err),
+			)
+		}
+
+		for _, container := range containers {
+			logger := rootLogger.With("container", container.ID, "cmd", container.Command)
+			err = containerStart(ctx, logger, dockerClient, reconn, container.ID)
+			if err != nil {
+				logger.Error("cannot write to container", "err", err)
+			}
+		}
+
+		for {
+			select {
+			case event := <-clientEvents:
+				switch event.Type {
+				case events.ContainerEventType:
+					logger := slog.With(
+						slog.String("event", string(event.Action)),
+						slog.String("container_id", event.Actor.ID),
+					)
+					switch event.Action {
+					case events.ActionStart:
+						logger.Info("Received start")
+						err = containerStart(ctx, logger, dockerClient, reconn, event.Actor.ID)
+						if err != nil {
+							logger.Error("cannot write to container", "err", err)
+							break
+						}
+					case events.ActionDie:
+						logger.Info("Received die")
+					default:
+						logger.Debug(
+							"Unhandled container action",
+							slog.Any("event_data", event),
+						)
+					}
+				default:
+					slog.Debug(
+						"Unhandled daemon event",
+						slog.Any("event_data", event),
+					)
+				}
+			case err := <-errs:
+				cancelEventCtx()
+				slog.Error(
+					"Error receiving events from daemon",
+					slog.Any("error", err),
+				)
+				panic(err)
+			}
+		}
+	}()
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	for s := range c {
+		slog.Info("Signal recieved. Exiting", slog.Any("signal", s))
+		break
+	}
+	ctx.Done()
+}

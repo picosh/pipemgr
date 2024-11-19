@@ -1,0 +1,21 @@
+services:
+  pipemgr:
+    build:
+      context: .
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - $HOME/.ssh/id_ed25519:/key:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+  httpbin:
+    image: kennethreitz/httpbin
+    command: gunicorn -b 0.0.0.0:8080 httpbin:app -k gevent --access-logfile -
+    ports:
+      - 8080:8080
+    labels:
+      pipemgr.enable: true
