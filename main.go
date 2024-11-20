@@ -47,7 +47,7 @@ func containerStart(ctx context.Context, logger *slog.Logger, client *client.Cli
 	)
 
 	isEnabled := false
-	if enabledRaw, ok := containerInfo.Config.Labels["pipemgr.enable"]; ok {
+	if enabledRaw, ok := containerInfo.Config.Labels["pipemgr"]; ok {
 		if enabledRaw == "true" {
 			isEnabled = true
 		}
