@@ -15,9 +15,9 @@ services:
       start_period: 1s
   httpbin:
     image: kennethreitz/httpbin
-    command: gunicorn -b 0.0.0.0:8080 httpbin:app -k gevent --access-logfile -
+    command: gunicorn -b 0.0.0.0:3000 httpbin:app -k gevent --access-logfile -
     ports:
-      - 8080:8080
+      - 3000:3000
     labels:
       pipemgr: true
     depends_on:
