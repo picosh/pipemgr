@@ -1,5 +1,5 @@
 services:
-  tunmgr:
+  pipemgr:
     build:
       cache_from:
         - type=gha
