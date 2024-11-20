@@ -16,7 +16,6 @@ import (
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/client"
 	"github.com/picosh/utils/pipe"
-	"github.com/picosh/utils/pipe/metrics"
 )
 
 func createDockerClient() *client.Client {
@@ -85,6 +84,7 @@ func main() {
 	remoteUserFlag := flag.String("remote-user", "", "The remote user to connect as")
 	keyLocationFlag := flag.String("remote-key-location", "/key", "The location on the filesystem of where to access the ssh key")
 	keyPassphraseFlag := flag.String("remote-key-passphrase", "", "The passphrase for an encrypted ssh key")
+	command := flag.String("command", "pub container-drain -b=false", "The command to run for the remote session")
 
 	flag.Parse()
 
@@ -142,10 +142,12 @@ func main() {
 	}
 	ctx := context.Background()
 
-	reconn := metrics.RegisterReconnectMetricRecorder(
+	reconn := pipe.NewReconnectReadWriteCloser(
 		ctx,
 		rootLogger,
 		info,
+		"pipemgr",
+		*command,
 		100,
 		10*time.Millisecond,
 	)
