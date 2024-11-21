@@ -19,7 +19,7 @@ services:
     ports:
       - 3000:3000
     labels:
-      pipemgr: true
+      pipemgr.enable: true
     depends_on:
       pipemgr:
         condition: service_healthy
