@@ -9,7 +9,7 @@ services:
   httpbin:
     image: kennethreitz/httpbin
     label:
-      pipemgr: true
+      pipemgr.enable: true
 ```
 
 This will send all stdout/stderr from `httpbin` to `pipe` or any other SSH
