@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"io"
@@ -16,6 +15,7 @@ import (
 	ct "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/picosh/utils/pipe"
 )
 
@@ -71,13 +71,9 @@ func containerStart(ctx context.Context, logger *slog.Logger, client *client.Cli
 	}
 
 	go func() {
-		scanner := bufio.NewScanner(readCloser)
-		for scanner.Scan() {
-			line := scanner.Text()
-			_, err = reconn.Write([]byte(line + "\n"))
-			if err != nil {
-				logger.Error("cannot write to pipe topic", "err", err)
-			}
+		_, err = stdcopy.StdCopy(reconn, reconn, readCloser)
+		if err != nil {
+			logger.Error("cannot write to pipe topic", "err", err)
 		}
 	}()
 
