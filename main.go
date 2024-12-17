@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"time"
 
@@ -58,6 +59,16 @@ func containerStart(ctx context.Context, logger *slog.Logger, client *client.Cli
 	if !isEnabled {
 		return nil
 	}
+
+	filterStr := ""
+	if filterRaw, ok := containerInfo.Config.Labels["pipemgr.filter"]; ok {
+		filterStr = strings.TrimSpace(filterRaw)
+	}
+	filter, err := regexp.Compile(filterStr)
+	if err != nil {
+		logger.Error("Invalid regex provided to pipemgr.filter", "err", err, "filter", filterStr)
+	}
+
 	logger.Info("connecting to logs", "container", containerID)
 	opts := ct.LogsOptions{
 		ShowStdout: true,
@@ -83,7 +94,15 @@ func containerStart(ctx context.Context, logger *slog.Logger, client *client.Cli
 		for {
 			for scanner.Scan() {
 				line := scanner.Text()
-				reconn.Write([]byte(line + "\n"))
+				if filter != nil {
+					if !filter.Match([]byte(line)) {
+						continue
+					}
+				}
+				_, err = reconn.Write([]byte(line + "\n"))
+				if err != nil {
+					logger.Error("could not write to pipe", "err", err)
+				}
 			}
 		}
 	}()
