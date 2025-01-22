@@ -25,7 +25,7 @@ func createDockerClient() *client.Client {
 	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		slog.Error(
-			"Unable to create docker client",
+			"unable to create docker client",
 			slog.Any("error", err),
 		)
 		panic(err)
@@ -38,14 +38,14 @@ func containerStart(ctx context.Context, logger *slog.Logger, client *client.Cli
 	containerInfo, err := client.ContainerInspect(context.Background(), containerID)
 	if err != nil {
 		logger.Error(
-			"Unable to inspect container info",
+			"unable to inspect container info",
 			slog.Any("error", err),
 		)
 		return err
 	}
 
 	logger.Debug(
-		"Container info",
+		"container info",
 		slog.Any("container_info", containerInfo),
 	)
 
@@ -66,7 +66,7 @@ func containerStart(ctx context.Context, logger *slog.Logger, client *client.Cli
 	}
 	filter, err := regexp.Compile(filterStr)
 	if err != nil {
-		logger.Error("Invalid regex provided to pipemgr.filter", "err", err, "filter", filterStr)
+		logger.Error("invalid regex provided to pipemgr.filter", "err", err, "filter", filterStr)
 	}
 
 	logger.Info("connecting to logs", "container", containerID)
@@ -99,6 +99,7 @@ func containerStart(ctx context.Context, logger *slog.Logger, client *client.Cli
 						continue
 					}
 				}
+				logger.Info("piping", "line", line)
 				_, err = reconn.Write([]byte(line + "\n"))
 				if err != nil {
 					logger.Error("could not write to pipe", "err", err)
@@ -155,7 +156,7 @@ func main() {
 		info, err := dockerClient.ContainerInspect(context.Background(), hostname)
 		if err != nil {
 			rootLogger.Error(
-				"Unable to find networks. Please provide a list to monitor",
+				"unable to find networks. Please provide a list to monitor",
 				slog.Any("error", err),
 			)
 			panic(err)
@@ -255,20 +256,20 @@ func main() {
 						logger.Info("Received die")
 					default:
 						logger.Debug(
-							"Unhandled container action",
+							"unhandled container action",
 							slog.Any("event_data", event),
 						)
 					}
 				default:
 					slog.Debug(
-						"Unhandled daemon event",
+						"unhandled daemon event",
 						slog.Any("event_data", event),
 					)
 				}
 			case err := <-errs:
 				cancelEventCtx()
 				slog.Error(
-					"Error receiving events from daemon",
+					"error receiving events from daemon",
 					slog.Any("error", err),
 				)
 				panic(err)
@@ -279,7 +280,7 @@ func main() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	for s := range c {
-		slog.Info("Signal recieved. Exiting", slog.Any("signal", s))
+		slog.Info("signal recieved, exiting", slog.Any("signal", s))
 		break
 	}
 	ctx.Done()
