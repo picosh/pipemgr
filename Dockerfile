@@ -27,4 +27,4 @@ RUN apk add --no-cache curl
 
 COPY --from=builder /usr/src/app/pipemgr /pipemgr
 
-CMD [ "/pipemgr" ]
+ENTRYPOINT [ "/pipemgr" ]

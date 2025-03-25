@@ -84,27 +84,36 @@ func containerStart(ctx context.Context, logger *slog.Logger, client *client.Cli
 
 	go func() {
 		r, w := io.Pipe()
+		defer r.Close()
+
 		go func() {
+			defer w.Close()
+
 			_, err = stdcopy.StdCopy(w, w, readCloser)
 			if err != nil {
-				logger.Error("cannot write to pipe topic", "err", err)
+				logger.Error("cannot split multiplex stream", "err", err)
 			}
 		}()
+
 		scanner := bufio.NewScanner(r)
-		for {
-			for scanner.Scan() {
-				line := scanner.Text()
-				if filter != nil {
-					if !filter.Match([]byte(line)) {
-						continue
-					}
-				}
-				logger.Info("piping", "line", line)
-				_, err = reconn.Write([]byte(line + "\n"))
-				if err != nil {
-					logger.Error("could not write to pipe", "err", err)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if filter != nil {
+				if !filter.Match([]byte(line)) {
+					continue
 				}
 			}
+
+			logger.Debug("piping", "line", line)
+
+			_, err = reconn.Write([]byte(line + "\n"))
+			if err != nil {
+				logger.Error("could not write to pipe", "err", err)
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			logger.Error("error reading from container logs", "err", err)
 		}
 	}()
 
