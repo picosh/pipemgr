@@ -200,6 +200,7 @@ func main() {
 	remoteHostnameFlag := flag.String("remote-hostname", "pipe.pico.sh", "The remote hostname to verify the host key")
 	remoteUserFlag := flag.String("remote-user", "", "The remote user to connect as")
 	keyLocationFlag := flag.String("remote-key-location", "/key", "The location on the filesystem of where to access the ssh key")
+	keyCertLocationFlag := flag.String("remote-key-cert-location", "", "The location on the filesystem of where to access the ssh key cert")
 	keyPassphraseFlag := flag.String("remote-key-passphrase", "", "The passphrase for an encrypted ssh key")
 	networkNames := flag.String("networks", "", "The networks to monitor for containers")
 	httpAddress := flag.String("http-address", "localhost:8080", "The address to bind the http server to")
@@ -260,11 +261,12 @@ func main() {
 	}
 
 	info := &pipe.SSHClientInfo{
-		RemoteHost:     *remoteHostFlag,
-		RemoteHostname: *remoteHostnameFlag,
-		RemoteUser:     *remoteUserFlag,
-		KeyLocation:    *keyLocationFlag,
-		KeyPassphrase:  *keyPassphraseFlag,
+		RemoteHost:          *remoteHostFlag,
+		RemoteHostname:      *remoteHostnameFlag,
+		RemoteUser:          *remoteUserFlag,
+		KeyLocation:         *keyLocationFlag,
+		CertificateLocation: *keyCertLocationFlag,
+		KeyPassphrase:       *keyPassphraseFlag,
 	}
 
 	reconn := pipe.NewReconnectReadWriteCloser(
@@ -292,6 +294,7 @@ func main() {
 		"remote_hostname", *remoteHostnameFlag,
 		"remote_user", *remoteUserFlag,
 		"key_location", *keyLocationFlag,
+		"key_cert_location", *keyCertLocationFlag,
 		"key_passphrase", *keyPassphraseFlag,
 	)
 

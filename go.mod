@@ -5,7 +5,7 @@ go 1.23.1
 require (
 	github.com/antoniomika/syncmap v1.0.0
 	github.com/docker/docker v28.0.2+incompatible
-	github.com/picosh/utils v0.0.0-20241120033529-8ca070c09bf4
+	github.com/picosh/utils v0.0.0-20251225195756-31cd283409c9
 )
 
 require (
