@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/antoniomika/syncmap"
@@ -23,12 +25,36 @@ import (
 	"github.com/picosh/utils/pipe"
 )
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func countMap[K comparable, V any](m *syncmap.Map[K, V]) int {
+	count := 0
+	m.Range(func(_ K, _ V) bool {
+		count++
+		return true
+	})
+	return count
+}
+
 type LogHandler struct {
-	Ctx         context.Context
-	Cancel      context.CancelFunc
-	Logger      *slog.Logger
-	ContainerID string
-	LogClients  *LogClients
+	Ctx            context.Context
+	Cancel         context.CancelFunc
+	Logger         *slog.Logger
+	ContainerID    string
+	LogClients     *LogClients
+	LinesForwarded atomic.Int64
+	LinesFiltered  atomic.Int64
+	WriteErrors    atomic.Int64
+	ReconnectCount atomic.Int64
+}
+
+func (lh *LogHandler) Stats() (linesForwarded, linesFiltered, writeErrors, reconnects int64) {
+	return lh.LinesForwarded.Load(), lh.LinesFiltered.Load(), lh.WriteErrors.Load(), lh.ReconnectCount.Load()
 }
 
 func (lh *LogHandler) Handle() {
@@ -50,7 +76,9 @@ func (lh *LogHandler) Handle() {
 
 			lh.Logger.Debug(
 				"container info",
-				slog.Any("container_info", containerInfo),
+				"container_name", containerInfo.Name,
+				"image", containerInfo.Config.Image,
+				"state", containerInfo.State.Status,
 			)
 
 			isEnabled := false
@@ -61,6 +89,10 @@ func (lh *LogHandler) Handle() {
 			}
 
 			if !isEnabled {
+				lh.Logger.Info(
+					"skipping container - pipemgr.enable label not set or not true",
+					"label_value", containerInfo.Config.Labels["pipemgr.enable"],
+				)
 				lh.LogClients.RemoveContainer(lh.ContainerID)
 				return
 			}
@@ -70,12 +102,25 @@ func (lh *LogHandler) Handle() {
 				filterStr = strings.TrimSpace(filterRaw)
 			}
 
-			filter, err := regexp.Compile(filterStr)
-			if err != nil {
-				lh.Logger.Error("invalid regex provided to pipemgr.filter", "err", err, "filter", filterStr)
+			var filter *regexp.Regexp
+			if filterStr != "" {
+				filter, err = regexp.Compile(filterStr)
+				if err != nil {
+					lh.Logger.Error("invalid regex provided to pipemgr.filter", "err", err, "filter", filterStr)
+					// Don't return - continue without filter
+				}
 			}
 
-			lh.Logger.Info("connecting to logs", "container", lh.ContainerID)
+			// Track reconnect attempts
+			reconnects := lh.ReconnectCount.Add(1)
+
+			lh.Logger.Info(
+				"connecting to container logs",
+				"container", lh.ContainerID,
+				"container_name", containerInfo.Name,
+				"filter", filterStr,
+				"reconnect_attempt", reconnects,
+			)
 
 			opts := ct.LogsOptions{
 				ShowStdout: true,
@@ -86,7 +131,8 @@ func (lh *LogHandler) Handle() {
 
 			readCloser, err := lh.LogClients.DockerClient.ContainerLogs(lh.Ctx, lh.ContainerID, opts)
 			if err != nil {
-				lh.Logger.Error("unable to fetch container logs", "err", err)
+				lh.Logger.Error("unable to fetch container logs", "err", err, "container", lh.ContainerID)
+				time.Sleep(5 * time.Second)
 				continue
 			}
 
@@ -103,7 +149,7 @@ func (lh *LogHandler) Handle() {
 
 				_, err := stdcopy.StdCopy(w, w, readCloser)
 				if err != nil {
-					lh.Logger.Error("cannot split multiplex stream", "err", err)
+					lh.Logger.Error("cannot split multiplex stream", "err", err, "container", lh.ContainerID)
 				}
 			}()
 
@@ -115,30 +161,57 @@ func (lh *LogHandler) Handle() {
 				}()
 
 				scanner := bufio.NewScanner(r)
+				lineCount := int64(0)
 				for scanner.Scan() {
 					line := scanner.Text()
+					lineCount++
+
 					if filter != nil {
 						if !filter.Match([]byte(line)) {
+							lh.LinesFiltered.Add(1)
+							// Log filtered lines at debug level every 1000 lines
+							if lineCount%1000 == 0 {
+								lh.Logger.Debug("log lines filtered", "lines_processed", lineCount, "sample_line", line[:min(80, len(line))])
+							}
 							continue
 						}
 					}
 
-					lh.Logger.Debug("piping", "line", line)
+					lh.Logger.Debug("forwarding log line", "line", line)
 
 					_, err := lh.LogClients.Pipe.Write([]byte(line + "\n"))
 					if err != nil {
-						lh.Logger.Error("could not write to pipe", "err", err)
+						lh.WriteErrors.Add(1)
+						lh.Logger.Error(
+							"could not write to pipe",
+							"err", err,
+							"container", lh.ContainerID,
+							"lines_forwarded_before_error", lineCount,
+						)
+					} else {
+						lh.LinesForwarded.Add(1)
 					}
 				}
 
 				if err := scanner.Err(); err != nil {
-					lh.Logger.Error("error reading from container logs", "err", err)
+					lh.Logger.Error("error reading from container logs", "err", err, "lines_processed", lineCount)
+				} else {
+					lh.Logger.Info(
+						"log stream closed",
+						"container", lh.ContainerID,
+						"lines_forwarded", lineCount,
+					)
 				}
 			}()
 
 			wg.Wait()
 
-			lh.Logger.Info("disconnected from logs, retrying", "container", lh.ContainerID)
+			lh.Logger.Info(
+				"disconnected from logs, retrying in 5s",
+				"container", lh.ContainerID,
+				"reconnect_attempt", reconnects,
+			)
+			time.Sleep(5 * time.Second)
 		}
 	}
 }
@@ -167,7 +240,10 @@ func (lc *LogClients) AddContainer(ctx context.Context, logger *slog.Logger, con
 	})
 
 	if !ok {
+		logger.Info("added container handler", "container_id", containerID, "total_containers", countMap(lc.Clients))
 		go handler.Handle()
+	} else {
+		logger.Debug("container handler already exists", "container_id", containerID)
 	}
 
 	return handler
@@ -176,8 +252,20 @@ func (lc *LogClients) AddContainer(ctx context.Context, logger *slog.Logger, con
 func (lc *LogClients) RemoveContainer(containerID string) {
 	handler, ok := lc.Clients.Load(containerID)
 	if ok {
+		lf, lfr, we, rc := handler.Stats()
+		lc.Logger.Info(
+			"removing container",
+			"container_id", containerID,
+			"lines_forwarded", lf,
+			"lines_filtered", lfr,
+			"write_errors", we,
+			"reconnects", rc,
+			"remaining_containers", countMap(lc.Clients)-1,
+		)
 		handler.Close()
 		lc.Clients.Delete(containerID)
+	} else {
+		lc.Logger.Debug("attempted to remove unknown container", "container_id", containerID)
 	}
 }
 
@@ -311,6 +399,31 @@ func main() {
 			w.WriteHeader(200)
 		})
 
+		http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			var stats []map[string]interface{}
+			logClients.Clients.Range(func(id string, handler *LogHandler) bool {
+				lf, lfr, we, rc := handler.Stats()
+				stats = append(stats, map[string]interface{}{
+					"container_id":    id,
+					"lines_forwarded": lf,
+					"lines_filtered":  lfr,
+					"write_errors":    we,
+					"reconnects":      rc,
+				})
+				return true
+			})
+			result, err := json.Marshal(map[string]interface{}{
+				"active_containers": len(stats),
+				"containers":        stats,
+			})
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Write(result)
+		})
+
 		err := http.ListenAndServe(*httpAddress, nil)
 		if err != nil {
 			rootLogger.Error("error with http server", slog.Any("error", err))
@@ -326,11 +439,18 @@ func main() {
 			"unable to list container from docker",
 			slog.Any("error", err),
 		)
-	}
-
-	for _, container := range containers {
-		logger := rootLogger.With("container", container.ID, "cmd", container.Command)
-		logClients.AddContainer(ctx, logger, container.ID)
+	} else {
+		rootLogger.Info("scanning existing containers", "total_found", len(containers))
+		for _, container := range containers {
+			logger := rootLogger.With(
+				"container", container.ID,
+				"container_name", container.Names[0],
+				"image", container.Image,
+				"state", container.State,
+			)
+			logger.Info("found existing container", "container_id", container.ID)
+			logClients.AddContainer(ctx, logger, container.ID)
+		}
 	}
 
 	c := make(chan os.Signal, 1)
@@ -343,15 +463,26 @@ forLoop:
 			switch event.Type {
 			case events.ContainerEventType:
 				logger := slog.With(
-					slog.String("event", string(event.Action)),
+					slog.String("event_type", string(event.Type)),
+					slog.String("event_action", string(event.Action)),
 					slog.String("container_id", event.Actor.ID),
+					"container_name", event.Actor.Attributes["name"],
+					"image", event.Actor.Attributes["image"],
 				)
 				switch event.Action {
 				case events.ActionStart:
-					logger.Info("Received start")
+					logger.Info("container started - adding handler")
 					logClients.AddContainer(ctx, logger, event.Actor.ID)
 				case events.ActionDie:
-					logger.Info("Received die")
+					logger.Info("container stopped - removing handler")
+					logClients.RemoveContainer(event.Actor.ID)
+				case events.ActionRestart:
+					logger.Info("container restarted - removing and re-adding handler")
+					logClients.RemoveContainer(event.Actor.ID)
+					time.Sleep(1 * time.Second) // brief delay to let container restart
+					logClients.AddContainer(ctx, logger, event.Actor.ID)
+				case events.ActionDestroy:
+					logger.Info("container destroyed - removing handler")
 					logClients.RemoveContainer(event.Actor.ID)
 				default:
 					logger.Debug(
@@ -362,7 +493,8 @@ forLoop:
 			default:
 				slog.Debug(
 					"unhandled daemon event",
-					slog.Any("event_data", event),
+					"event_type", string(event.Type),
+					"event_action", string(event.Action),
 				)
 			}
 		case err := <-errs:
@@ -372,7 +504,7 @@ forLoop:
 			)
 			break forLoop
 		case s := <-c:
-			slog.Info("signal recieved, exiting", slog.Any("signal", s))
+			slog.Info("signal received, exiting", slog.Any("signal", s))
 			break forLoop
 		case <-ctx.Done():
 			slog.Info("context cancelled, exiting")
